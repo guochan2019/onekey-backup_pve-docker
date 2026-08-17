@@ -275,6 +275,7 @@ do_backup() {
   echo ""
   info "=== 开始打包 (${DATE}) ==="
   i=0
+  BACKED=()
   for k in "${BK_KEYS[@]}"; do
     [ -n "${SELECTED[$k]+x}" ] || continue
     i=$((i+1))
@@ -304,19 +305,15 @@ do_backup() {
     if [ "$RC" -ge 2 ]; then
       err "打包失败: ${DISP} (tar 退出码 ${RC})"
     fi
+    BACKED+=("$PKG")
   done
 
-  # 9. 汇总
+  # 9. 汇总（仅本次打包的项；选择性备份时不会列出目录里其他同日包）
   echo ""
   info "========== 备份完成 =========="
-  for f in "$BK_DIR"/*_${DATE}.tar.zst; do
-    [ -f "$f" ] && printf "  %-46s %s\n" "$(basename "$f")" "$(du -h "$f" | cut -f1)"
-  done
-  for sub in "$BK_DIR"/*/; do
-    [ -d "$sub" ] || continue
-    for f in "$sub"*_${DATE}.tar.zst; do
-      [ -f "$f" ] && printf "  %-46s %s\n" "$(basename "$sub")/$(basename "$f")" "$(du -h "$f" | cut -f1)"
-    done
+  for f in "${BACKED[@]}"; do
+    [ -f "$f" ] || continue
+    printf "  %-46s %s\n" "${f#$BK_DIR/}" "$(du -h "$f" | cut -f1)"
   done
   echo ""
 }
