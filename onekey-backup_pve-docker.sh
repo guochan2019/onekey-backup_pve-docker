@@ -3,7 +3,8 @@
 # onekey-backup_pve-docker — Docker 数据一键备份/还原脚本
 # 适用环境: PVE 宿主 / Docker LXC（能访问 /mnt/nvme1 与 /mnt/backup 的机器）
 # 功能:
-#   备份: /mnt/nvme1/ 下的一级目录，按类型打包 .tar.zst 到备份目录
+#   备份: /mnt/nvme1/ 下的一级目录，分组展示 + 交互选择（编号/范围/关键字/a全部），
+#         仅打包选中项，按类型打包 .tar.zst 到备份目录
 #         - 容器目录 (appdata/appdata_deb): 其下容器子目录分别打包
 #           输出: <备份目录>/<容器目录>/<容器名>_<YYYYMMDD>.tar.zst
 #         - 其他目录 (docker/docker_deb/mediaout): 整个目录打包
@@ -145,31 +146,119 @@ do_backup() {
     err "源目录 ${SOURCE_ROOT} 下没有子目录可备份"
   fi
 
-  # 2. 显示待备份内容（分类展示）
-  echo "源目录: ${SOURCE_ROOT}"
-  echo "待备份内容:"
+  # 2. 构建备份项列表（key="类型/名称"；类型=root 普通目录整体打包 / 容器目录名=其下容器分别打包）
+  #    容器目录下无子目录时跳过不列入选项
+  BK_KEYS=()
   for d in "${DIRS[@]}"; do
     if is_container_dir "$d"; then
       mapfile -t SUBS < <(find "$SOURCE_ROOT/$d" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' | sort)
       if [ "${#SUBS[@]}" -eq 0 ]; then
         warn "  - ${d}/ (容器目录，无子目录，跳过)"
+        continue
+      fi
+      for s in "${SUBS[@]}"; do
+        BK_KEYS+=("${d}/${s}")
+      done
+    else
+      BK_KEYS+=("root/${d}")
+    fi
+  done
+
+  # 3. 排序：root 组优先，组内字母序（与还原分组一致）
+  mapfile -t BK_KEYS < <(printf '%s\n' "${BK_KEYS[@]}" | sort -t/ -k1,1r -k2,2)
+
+  # 4. 显示待备份内容（分组 + 全局编号 + 源大小；挂载点标注）
+  echo "源目录: ${SOURCE_ROOT}"
+  echo "待备份内容:"
+  PREV_TYPE=""
+  n=0
+  for k in "${BK_KEYS[@]}"; do
+    type="${k%%/*}"
+    name="${k#*/}"
+    if [ "$type" != "$PREV_TYPE" ]; then
+      if [ "$type" = "root" ]; then
+        echo "[顶层目录]"
       else
-        warn "  - ${d}/ (容器目录，${#SUBS[@]} 个容器子目录分别打包)"
-        for s in "${SUBS[@]}"; do
-          info "      - $s"
-        done
+        echo "[${type} 容器]"
+      fi
+      PREV_TYPE="$type"
+    fi
+    n=$((n+1))
+    if [ "$type" = "root" ]; then
+      SIZE=$(du -sh "$SOURCE_ROOT/$name" 2>/dev/null | cut -f1)
+      if findmnt "$SOURCE_ROOT/$name" >/dev/null 2>&1; then
+        printf "  [%d] %-16s (%s) ⚠ 挂载点\n" "$n" "$name" "$SIZE"
+      else
+        printf "  [%d] %-16s (%s)\n" "$n" "$name" "$SIZE"
       fi
     else
-      if findmnt "$SOURCE_ROOT/$d" >/dev/null 2>&1; then
-        warn "  - $d (整体打包，⚠ 挂载点，备份将包含其挂载内容)"
-      else
-        info "  - $d (整体打包)"
-      fi
+      SIZE=$(du -sh "$SOURCE_ROOT/$type/$name" 2>/dev/null | cut -f1)
+      printf "  [%d] %-16s (%s)\n" "$n" "$name" "$SIZE"
     fi
   done
   echo ""
 
-  # 3. 交互确认备份目录（默认 BACKUP_ROOT，可修改）
+  # 5. 多轮选择（编号/范围/关键字，a=全部，回车完成；备份无历史版本概念）
+  declare -A SELECTED
+  while true; do
+    if [ "${#SELECTED[@]}" -gt 0 ]; then
+      read -p "已选 ${#SELECTED[@]} 项。输入备份目标（编号/范围/关键字，a=全部，回车完成）: " SELECT </dev/tty
+    else
+      read -p "输入备份目标（编号/范围/关键字，a=全部）: " SELECT </dev/tty
+    fi
+    SELECT=$(echo "$SELECT" | tr -s ' ')
+    [ -z "$SELECT" ] && break
+
+    # a 全部
+    case "$SELECT" in
+      a|A)
+        for k in "${BK_KEYS[@]}"; do
+          SELECTED[$k]=1
+        done
+        break
+        ;;
+    esac
+
+    # 编号 / 范围 / 关键字（read -ra 分词且不做 glob 展开，关键字含 * ? [ 安全）
+    read -ra TOKS <<< "$SELECT"
+    for tok in "${TOKS[@]}"; do
+      case "$tok" in
+        *-*)  # 范围 2-5
+          a="${tok%-*}"
+          b="${tok#*-}"
+          case "$a" in *[!0-9]*) err "无效范围: ${tok}" ;; esac
+          case "$b" in *[!0-9]*) err "无效范围: ${tok}" ;; esac
+          [ "$a" -ge 1 ] && [ "$b" -le "${#BK_KEYS[@]}" ] || err "范围越界: ${tok}"
+          [ "$a" -le "$b" ] || err "范围起止颠倒: ${tok}"
+          for ((m=a; m<=b; m++)); do
+            SELECTED["${BK_KEYS[$((m-1))]}"]=1
+          done
+          ;;
+        *[!0-9]*)  # 关键字模糊匹配
+          HIT=0
+          for k in "${BK_KEYS[@]}"; do
+            if [[ "$k" == *"$tok"* ]]; then
+              SELECTED[$k]=1
+              HIT=1
+            fi
+          done
+          if [ "$HIT" -eq 0 ]; then
+            warn "  未匹配到含 '${tok}' 的备份项"
+          fi
+          ;;
+        *)  # 编号
+          [ "$tok" -ge 1 ] && [ "$tok" -le "${#BK_KEYS[@]}" ] || err "编号越界: ${tok}"
+          SELECTED["${BK_KEYS[$((tok-1))]}"]=1
+          ;;
+      esac
+    done
+  done
+
+  if [ "${#SELECTED[@]}" -eq 0 ]; then
+    err "未选择任何备份项"
+  fi
+
+  # 6. 交互确认备份目录（默认 BACKUP_ROOT，可修改）
   read -p "备份目录 (默认 ${BACKUP_ROOT}): " BK_DIR </dev/tty
   BK_DIR="${BK_DIR:-$BACKUP_ROOT}"
   check_abs_path "$BK_DIR"
@@ -178,66 +267,46 @@ do_backup() {
   esac
   mkdir -p "$BK_DIR"
 
-  # 4. 统计总包数（进度用）
-  TOTAL=0
-  for d in "${DIRS[@]}"; do
-    if is_container_dir "$d"; then
-      N=$(find "$SOURCE_ROOT/$d" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
-      TOTAL=$((TOTAL+N))
-    else
-      TOTAL=$((TOTAL+1))
-    fi
-  done
+  # 7. 统计总包数（进度用，=选中项数）
+  TOTAL=${#SELECTED[@]}
 
-  # 5. 逐个打包
+  # 8. 逐个打包（仅选中项，按 BK_KEYS 顺序）
   DATE=$(date +%Y%m%d)
   echo ""
   info "=== 开始打包 (${DATE}) ==="
   i=0
-  for d in "${DIRS[@]}"; do
-    if is_container_dir "$d"; then
-      mapfile -t SUBS < <(find "$SOURCE_ROOT/$d" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' | sort)
-      [ "${#SUBS[@]}" -eq 0 ] && continue
-      mkdir -p "$BK_DIR/$d"
-      for s in "${SUBS[@]}"; do
-        i=$((i+1))
-        PKG="${BK_DIR}/${d}/${s}_${DATE}.tar.zst"
-        if [ -f "$PKG" ]; then
-          warn "  [${i}/${TOTAL}] ${d}/${s} 存在同日备份，覆盖重新打包"
-        else
-          info "  [${i}/${TOTAL}] ${d}/${s} ..."
-        fi
-        # 后台打包 + 进度轮询；tar 退出码 1(运行中文件变化) 容忍并提示，>=2 报错停
-        ERRLOG=$(mktemp)
-        nice -n 19 ionice -c3 tar -I "zstd -T${ZSTD_THREADS} -6" -cf "$PKG" -C "$SOURCE_ROOT/$d" "$s" 2>"$ERRLOG" &
-        TAR_PID=$!
-        RC=0
-        wait_tar "$TAR_PID" "${d}/${s}" "$PKG" 0 "$i" "$TOTAL" "已打包" "$ERRLOG" || RC=$?
-        if [ "$RC" -ge 2 ]; then
-          err "打包失败: ${d}/${s} (tar 退出码 ${RC})"
-        fi
-      done
+  for k in "${BK_KEYS[@]}"; do
+    [ -n "${SELECTED[$k]+x}" ] || continue
+    i=$((i+1))
+    type="${k%%/*}"
+    name="${k#*/}"
+    if [ "$type" = "root" ]; then
+      PKG="${BK_DIR}/${name}_${DATE}.tar.zst"
+      SRC_ROOT="$SOURCE_ROOT"
+      DISP="$name"
     else
-      i=$((i+1))
-      PKG="${BK_DIR}/${d}_${DATE}.tar.zst"
-      if [ -f "$PKG" ]; then
-        warn "  [${i}/${TOTAL}] ${d} 存在同日备份，覆盖重新打包"
-      else
-        info "  [${i}/${TOTAL}] ${d} ..."
-      fi
-      # 后台打包 + 进度轮询；tar 退出码 1 容忍并提示，>=2 报错停
-      ERRLOG=$(mktemp)
-      nice -n 19 ionice -c3 tar -I "zstd -T${ZSTD_THREADS} -6" -cf "$PKG" -C "$SOURCE_ROOT" "$d" 2>"$ERRLOG" &
-      TAR_PID=$!
-      RC=0
-      wait_tar "$TAR_PID" "$d" "$PKG" 0 "$i" "$TOTAL" "已打包" "$ERRLOG" || RC=$?
-      if [ "$RC" -ge 2 ]; then
-        err "打包失败: ${d} (tar 退出码 ${RC})"
-      fi
+      mkdir -p "$BK_DIR/$type"
+      PKG="${BK_DIR}/${type}/${name}_${DATE}.tar.zst"
+      SRC_ROOT="$SOURCE_ROOT/$type"
+      DISP="${type}/${name}"
+    fi
+    if [ -f "$PKG" ]; then
+      warn "  [${i}/${TOTAL}] ${DISP} 存在同日备份，覆盖重新打包"
+    else
+      info "  [${i}/${TOTAL}] ${DISP} ..."
+    fi
+    # 后台打包 + 进度轮询；tar 退出码 1(运行中文件变化) 容忍并提示，>=2 报错停
+    ERRLOG=$(mktemp)
+    nice -n 19 ionice -c3 tar -I "zstd -T${ZSTD_THREADS} -6" -cf "$PKG" -C "$SRC_ROOT" "$name" 2>"$ERRLOG" &
+    TAR_PID=$!
+    RC=0
+    wait_tar "$TAR_PID" "$DISP" "$PKG" 0 "$i" "$TOTAL" "已打包" "$ERRLOG" || RC=$?
+    if [ "$RC" -ge 2 ]; then
+      err "打包失败: ${DISP} (tar 退出码 ${RC})"
     fi
   done
 
-  # 6. 汇总
+  # 9. 汇总
   echo ""
   info "========== 备份完成 =========="
   for f in "$BK_DIR"/*_${DATE}.tar.zst; do
@@ -251,7 +320,6 @@ do_backup() {
   done
   echo ""
 }
-
 # ---------- 还原 ----------
 do_restore() {
   echo ""
